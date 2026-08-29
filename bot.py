@@ -25,6 +25,18 @@ MM_FEE_PERCENT = 3
 # Nama channel tempat user bisa cek ulang perhitungan tax secara manual
 TAX_CHANNEL_NAME = os.getenv("TAX_CHANNEL_NAME", "midman-tax")
 
+# Nama channel tempat bot otomatis posting proof/testimoni setelah transaksi selesai
+TESTIMONI_CHANNEL_NAME = os.getenv("TESTIMONI_CHANNEL_NAME", "testimoni")
+
+# Potongan admin buat pencairan dana ke Seller, tergantung metode yang dipilih
+# Seller. Ini DIPOTONG dari harga barang (Seller nerima harga - potongan).
+# Ubah nominal di sini kalau tarif admin e-wallet kamu berubah.
+PAYOUT_ADMIN_FEE = {
+    "DANA": 1000,
+    "GoPay": 0,
+    "QRIS": 0,
+}
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -65,6 +77,34 @@ def hitung_fee(harga: int, persen: float = MM_FEE_PERCENT) -> tuple[int, int]:
   fee = round(harga * persen / 100)
   total = harga + fee
   return fee, total
+
+
+def cari_channel(guild: discord.Guild, keyword: str) -> discord.TextChannel | None:
+  """Cari text channel yang NAMANYA MENGANDUNG keyword (case-insensitive),
+  bukan harus sama persis. Ini penting karena banyak server kasih emoji di
+  depan nama channel (misal '📸・testimoni'), jadi exact-match nama gak
+  bakal ketemu walau channel-nya ada."""
+  keyword = keyword.lower()
+  for channel in guild.text_channels:
+    if keyword in channel.name.lower():
+      return channel
+  return None
+
+
+def buat_embed_dasar(
+    guild: discord.Guild,
+    title: str,
+    description: str = None,
+    color: discord.Color = discord.Color.blue(),
+) -> discord.Embed:
+  """Bikin embed dengan tampilan konsisten -- kasih thumbnail ikon server
+  (kalau ada) & timestamp otomatis, biar semua embed bot kelihatan seragam
+  dan lebih profesional."""
+  embed = discord.Embed(title=title, description=description, color=color)
+  if guild.icon:
+    embed.set_thumbnail(url=guild.icon.url)
+  embed.timestamp = discord.utils.utcnow()
+  return embed
 
 
 # ---------- Step 1: Pilih partner + tentukan siapa Buyer (dropdown, bukan modal) ----------
@@ -278,13 +318,31 @@ async def create_ticket_channel(
       "confirm_message_id": None,
       "seller_detail_message_id": None,
       "tax_prompt_message_id": None,
+      # ---- Data buat alur setelah item di-drop ke Buyer ----
+      "item_received": False,
+      "item_received_message_id": None,
+      "payout_method": None,
+      "payout_account": None,
+      "payout_name": None,
+      "payout_qris_image_url": None,
+      "payout_admin_fee": None,
+      "payout_net": None,
+      "payout_prompt_message_id": None,
+      "payout_confirmed_mm": False,
+      "mm_confirmed_by_id": None,
+      "mm_confirmed_by_name": None,
+      "mm_transfer_message_id": None,
+      "payout_confirmed_seller": False,
+      "seller_received_message_id": None,
   }
 
-  intro_embed = discord.Embed(
+  intro_embed = buat_embed_dasar(
+      guild,
       title="✨ Sesi Middleman XypherStore Dibuka",
       description=(
           f"Halo {owner.mention} & {partner.mention}! Terima kasih telah "
-          "menggunakan jasa Middleman.\n\n"
+          "menggunakan jasa Middleman.\n"
+          "───────────────────────\n"
           f"🛒 **Buyer:** {buyer.mention}\n"
           f"💰 **Seller:** {seller.mention}\n"
           f"📦 **Item:** {item_name}\n"
@@ -301,7 +359,8 @@ async def create_ticket_channel(
   await ticket_channel.send(view=CloseTicketView())
 
   # ---------- Prompt buat Middleman input tax dulu ----------
-  tax_prompt_embed = discord.Embed(
+  tax_prompt_embed = buat_embed_dasar(
+      guild,
       title="🧮 Menunggu Middleman Set Tax",
       description=(
           f"Role `{MIDDLEMAN_ROLE_NAME}`, silakan klik tombol di bawah untuk "
@@ -426,10 +485,12 @@ async def kirim_payment_embed(
   buyer_mention = buyer.mention if buyer else "Buyer"
   seller_mention = seller.mention if seller else "Seller"
 
-  payment_embed = discord.Embed(
+  payment_embed = buat_embed_dasar(
+      guild,
       title="💳 Pembayaran ke XypherStore Middleman",
       color=discord.Color.blue(),
   )
+  payment_embed.set_footer(text="XypherStore Secure Transaction System")
   payment_embed.add_field(
       name="🔹 Detail Transaksi",
       value=(
@@ -462,7 +523,7 @@ async def kirim_payment_embed(
       inline=False,
   )
 
-  tax_channel = discord.utils.get(guild.text_channels, name=TAX_CHANNEL_NAME)
+  tax_channel = cari_channel(guild, TAX_CHANNEL_NAME)
   tax_channel_ref = tax_channel.mention if tax_channel else f"#{TAX_CHANNEL_NAME}"
   payment_embed.add_field(
       name="🧮 Cek Ulang Perhitungan",
@@ -708,7 +769,8 @@ class BuyerGrowIDModal(discord.ui.Modal, title="GrowID Kamu (Buyer)"):
 
     seller = interaction.guild.get_member(data["seller_id"])
 
-    final_embed = discord.Embed(
+    final_embed = buat_embed_dasar(
+        interaction.guild,
         title="✅ Semua Detail Transaksi Lengkap",
         color=discord.Color.gold(),
     )
@@ -739,6 +801,452 @@ class BuyerGrowIDModal(discord.ui.Modal, title="GrowID Kamu (Buyer)"):
         await msg.edit(view=disabled_view)
       except discord.NotFound:
         pass
+
+    # Munculin tombol buat Buyer konfirmasi barang udah diterima di game
+    item_received_prompt = await interaction.channel.send(
+        content=f"{interaction.guild.get_member(data['buyer_id']).mention if interaction.guild.get_member(data['buyer_id']) else ''}",
+        embed=discord.Embed(
+            description="🎮 Buyer, silakan cek item-nya di dalam game dulu. Kalau sudah "
+            "diterima dengan aman, klik tombol di bawah.",
+            color=discord.Color.blue(),
+        ),
+        view=ItemReceivedView(),
+    )
+    data["item_received_message_id"] = item_received_prompt.id
+
+
+# ---------- Tombol "Barang Sudah Diterima" -- KHUSUS BUYER ----------
+class ItemReceivedView(discord.ui.View):
+
+  def __init__(self):
+    super().__init__(timeout=None)
+
+  @discord.ui.button(
+      label="✅ Barang Sudah Diterima (Buyer)",
+      style=discord.ButtonStyle.green,
+      custom_id="item_received_btn",
+  )
+  async def item_received(
+      self, interaction: discord.Interaction, button: discord.ui.Button
+  ):
+    data = TICKET_DATA.get(interaction.channel.id)
+    if not data:
+      await interaction.response.send_message(
+          "⚠️ Data tiket tidak ditemukan (mungkin bot sempat restart).",
+          ephemeral=True,
+      )
+      return
+
+    if interaction.user.id != data["buyer_id"]:
+      await interaction.response.send_message(
+          "❌ Cuma Buyer di transaksi ini yang bisa konfirmasi ini.", ephemeral=True
+      )
+      return
+
+    if data.get("item_received"):
+      await interaction.response.send_message(
+          "⚠️ Konfirmasi ini sudah pernah dilakukan.", ephemeral=True
+      )
+      return
+
+    data["item_received"] = True
+
+    # Matikan tombol biar gak dobel-klik
+    disabled_view = ItemReceivedView()
+    for child in disabled_view.children:
+      child.disabled = True
+    await interaction.response.edit_message(view=disabled_view)
+
+    seller = interaction.guild.get_member(data["seller_id"])
+    payout_embed = buat_embed_dasar(
+        interaction.guild,
+        title="💰 Waktunya Pencairan Dana ke Seller",
+        description=(
+            f"Buyer sudah konfirmasi menerima barang dengan aman.\n\n"
+            f"{seller.mention if seller else 'Seller'}, silakan pilih metode "
+            "pencairan dana kamu di bawah ini."
+        ),
+        color=discord.Color.gold(),
+    )
+    payout_embed.add_field(
+        name="ℹ️ Catatan Potongan Admin",
+        value=(
+            f"• DANA: potong admin Rp {PAYOUT_ADMIN_FEE['DANA']:,}\n"
+            f"• GoPay: gratis admin\n"
+            f"• QRIS: gratis admin"
+        ),
+        inline=False,
+    )
+    payout_msg = await interaction.channel.send(
+        content=f"{seller.mention if seller else ''}",
+        embed=payout_embed,
+        view=PayoutMethodView(),
+    )
+    data["payout_prompt_message_id"] = payout_msg.id
+
+
+# ---------- Dropdown "Pilih Metode Pencairan Dana" -- KHUSUS SELLER ----------
+class PayoutMethodView(discord.ui.View):
+
+  def __init__(self):
+    super().__init__(timeout=None)
+
+  @discord.ui.select(
+      placeholder="💳 Pilih metode pencairan dana kamu",
+      min_values=1,
+      max_values=1,
+      custom_id="payout_method_select",
+      options=[
+          discord.SelectOption(label="DANA", value="DANA", emoji="💙"),
+          discord.SelectOption(label="GoPay", value="GoPay", emoji="💚"),
+          discord.SelectOption(label="QRIS", value="QRIS", emoji="🔲"),
+      ],
+  )
+  async def select_method(
+      self, interaction: discord.Interaction, select: discord.ui.Select
+  ):
+    data = TICKET_DATA.get(interaction.channel.id)
+    if not data:
+      await interaction.response.send_message(
+          "⚠️ Data tiket tidak ditemukan (mungkin bot sempat restart).",
+          ephemeral=True,
+      )
+      return
+
+    if interaction.user.id != data["seller_id"]:
+      await interaction.response.send_message(
+          "❌ Cuma Seller di transaksi ini yang bisa isi bagian ini.",
+          ephemeral=True,
+      )
+      return
+
+    if data.get("payout_method"):
+      await interaction.response.send_message(
+          "⚠️ Info pencairan dana sudah pernah diisi.", ephemeral=True
+      )
+      return
+
+    metode = select.values[0]
+    if metode == "QRIS":
+      await interaction.response.send_modal(PayoutQrisModal())
+    else:
+      await interaction.response.send_modal(PayoutDetailModal(metode))
+
+
+class PayoutDetailModal(discord.ui.Modal, title="Info Pencairan Dana (Seller)"):
+
+  nomor_tujuan = discord.ui.TextInput(
+      label="Nomor Tujuan",
+      placeholder="Contoh: 08123456789",
+      max_length=30,
+  )
+  nama_penerima = discord.ui.TextInput(
+      label="Nama Penerima",
+      placeholder="Contoh: Syabria",
+      max_length=50,
+  )
+
+  def __init__(self, metode: str):
+    super().__init__()
+    self.metode = metode
+
+  async def on_submit(self, interaction: discord.Interaction):
+    channel_id = interaction.channel.id
+    data = TICKET_DATA.get(channel_id, {})
+
+    fee = PAYOUT_ADMIN_FEE.get(self.metode, 0)
+    net = data["harga"] - fee
+
+    data["payout_method"] = self.metode
+    data["payout_account"] = self.nomor_tujuan.value
+    data["payout_name"] = self.nama_penerima.value
+    data["payout_admin_fee"] = fee
+    data["payout_net"] = net
+    TICKET_DATA[channel_id] = data
+
+    # Matikan dropdown biar gak dobel-isi
+    await _matikan_payout_dropdown(interaction.channel, data)
+
+    mm_embed = buat_embed_dasar(
+        interaction.guild,
+        title="🏦 Instruksi Transfer ke Seller",
+        description=f"Role `{MIDDLEMAN_ROLE_NAME}`, silakan transfer sesuai detail di bawah.",
+        color=discord.Color.orange(),
+    )
+    mm_embed.add_field(name="💳 Metode", value=self.metode, inline=True)
+    mm_embed.add_field(name="🔢 Nomor Tujuan", value=self.nomor_tujuan.value, inline=True)
+    mm_embed.add_field(name="🙍 Nama Penerima", value=self.nama_penerima.value, inline=False)
+    mm_embed.add_field(
+        name="🧮 Rincian",
+        value=(
+            f"**Harga Barang:** Rp {data['harga']:,}\n"
+            f"**Potongan Admin ({self.metode}):** Rp {fee:,}\n"
+            f"**Total Transfer ke Seller:** Rp {net:,}"
+        ),
+        inline=False,
+    )
+
+    await interaction.response.send_message(embed=mm_embed, view=PayoutConfirmMMView())
+    sent = await interaction.original_response()
+    data["mm_transfer_message_id"] = sent.id
+
+
+class PayoutQrisModal(discord.ui.Modal, title="Info Pencairan Dana - QRIS (Seller)"):
+
+  nama_penerima = discord.ui.TextInput(
+      label="Nama Pemilik QRIS",
+      placeholder="Contoh: Syabria",
+      max_length=50,
+  )
+
+  async def on_submit(self, interaction: discord.Interaction):
+    channel_id = interaction.channel.id
+    data = TICKET_DATA.get(channel_id, {})
+
+    # QRIS gratis admin -- gak ada nomor tujuan, yang dibutuhin gambar QRIS-nya.
+    fee = PAYOUT_ADMIN_FEE.get("QRIS", 0)
+    net = data["harga"] - fee
+
+    data["payout_name"] = self.nama_penerima.value
+    data["payout_admin_fee"] = fee
+    data["payout_net"] = net
+    TICKET_DATA[channel_id] = data
+
+    await interaction.response.send_message(
+        content=f"{interaction.user.mention}",
+        embed=discord.Embed(
+            description=(
+                "📸 Silakan **kirim/upload gambar QRIS kamu** di channel ini sekarang "
+                "(kirim sebagai lampiran gambar, bukan link).\n\n"
+                "Kamu punya waktu 5 menit sebelum diminta ulang."
+            ),
+            color=discord.Color.blue(),
+        ),
+    )
+
+    def cek_pesan(m: discord.Message) -> bool:
+      return (
+          m.channel.id == channel_id
+          and m.author.id == data["seller_id"]
+          and len(m.attachments) > 0
+      )
+
+    try:
+      pesan_qris = await bot.wait_for("message", check=cek_pesan, timeout=300)
+    except asyncio.TimeoutError:
+      await interaction.channel.send(
+          f"⚠️ {interaction.user.mention} waktu upload QRIS habis. Silakan pilih "
+          "ulang metode QRIS di dropdown untuk coba lagi."
+      )
+      return
+
+    gambar_qris_url = pesan_qris.attachments[0].url
+    data["payout_method"] = "QRIS"
+    data["payout_qris_image_url"] = gambar_qris_url
+
+    # Matikan dropdown biar gak dobel-isi, baru sekarang setelah gambar diterima
+    await _matikan_payout_dropdown(interaction.channel, data)
+
+    mm_embed = buat_embed_dasar(
+        interaction.guild,
+        title="🏦 Instruksi Transfer ke Seller (QRIS)",
+        description=(
+            f"Role `{MIDDLEMAN_ROLE_NAME}`, silakan scan QRIS di bawah untuk transfer."
+        ),
+        color=discord.Color.orange(),
+    )
+    mm_embed.add_field(name="💳 Metode", value="QRIS", inline=True)
+    mm_embed.add_field(name="🙍 Nama Pemilik", value=self.nama_penerima.value, inline=True)
+    mm_embed.add_field(
+        name="🧮 Rincian",
+        value=(
+            f"**Harga Barang:** Rp {data['harga']:,}\n"
+            f"**Potongan Admin (QRIS):** Rp {fee:,}\n"
+            f"**Total Transfer ke Seller:** Rp {net:,}"
+        ),
+        inline=False,
+    )
+    mm_embed.set_image(url=gambar_qris_url)
+
+    await interaction.channel.send(embed=mm_embed, view=PayoutConfirmMMView())
+
+
+async def _matikan_payout_dropdown(channel: discord.TextChannel, data: dict):
+  """Matikan dropdown pilih metode pencairan dana biar gak dobel-isi."""
+  prompt_id = data.get("payout_prompt_message_id")
+  if prompt_id:
+    try:
+      prompt_msg = await channel.fetch_message(prompt_id)
+      disabled_view = PayoutMethodView()
+      for child in disabled_view.children:
+        child.disabled = True
+      await prompt_msg.edit(view=disabled_view)
+    except discord.NotFound:
+      pass
+
+
+# ---------- Tombol "Sudah Transfer ke Seller" -- KHUSUS role Middleman ----------
+class PayoutConfirmMMView(discord.ui.View):
+
+  def __init__(self):
+    super().__init__(timeout=None)
+
+  @discord.ui.button(
+      label="✅ Sudah Transfer ke Seller",
+      style=discord.ButtonStyle.blurple,
+      custom_id="mm_transfer_confirm_btn",
+  )
+  async def confirm_transfer(
+      self, interaction: discord.Interaction, button: discord.ui.Button
+  ):
+    if not is_middleman(interaction.user):
+      await interaction.response.send_message(
+          f"❌ Cuma role `{MIDDLEMAN_ROLE_NAME}` yang bisa konfirmasi ini.",
+          ephemeral=True,
+      )
+      return
+
+    data = TICKET_DATA.get(interaction.channel.id)
+    if not data:
+      await interaction.response.send_message(
+          "⚠️ Data tiket tidak ditemukan (mungkin bot sempat restart).",
+          ephemeral=True,
+      )
+      return
+
+    if data.get("payout_confirmed_mm"):
+      await interaction.response.send_message(
+          "⚠️ Transfer ke Seller sudah pernah dikonfirmasi.", ephemeral=True
+      )
+      return
+
+    data["payout_confirmed_mm"] = True
+    data["mm_confirmed_by_id"] = interaction.user.id
+    data["mm_confirmed_by_name"] = interaction.user.display_name
+
+    disabled_view = PayoutConfirmMMView()
+    for child in disabled_view.children:
+      child.disabled = True
+    await interaction.response.edit_message(view=disabled_view)
+
+    seller = interaction.guild.get_member(data["seller_id"])
+    seller_confirm_embed = discord.Embed(
+        title="🔔 Cek Dana Kamu",
+        description=(
+            f"{interaction.user.mention} sudah menandai dana sebesar "
+            f"Rp {data['payout_net']:,} sudah ditransfer ke kamu lewat "
+            f"{data['payout_method']}.\n\n"
+            f"{seller.mention if seller else 'Seller'}, tolong cek dan klik "
+            "tombol di bawah kalau dana sudah benar-benar masuk."
+        ),
+        color=discord.Color.blue(),
+    )
+    seller_msg = await interaction.channel.send(
+        content=f"{seller.mention if seller else ''}",
+        embed=seller_confirm_embed,
+        view=SellerReceivedView(),
+    )
+    data["seller_received_message_id"] = seller_msg.id
+
+
+# ---------- Tombol "Dana Diterima" -- KHUSUS SELLER, lalu auto-post testimoni ----------
+class SellerReceivedView(discord.ui.View):
+
+  def __init__(self):
+    super().__init__(timeout=None)
+
+  @discord.ui.button(
+      label="✅ Dana Diterima",
+      style=discord.ButtonStyle.green,
+      custom_id="seller_received_btn",
+  )
+  async def confirm_received(
+      self, interaction: discord.Interaction, button: discord.ui.Button
+  ):
+    data = TICKET_DATA.get(interaction.channel.id)
+    if not data:
+      await interaction.response.send_message(
+          "⚠️ Data tiket tidak ditemukan (mungkin bot sempat restart).",
+          ephemeral=True,
+      )
+      return
+
+    if interaction.user.id != data["seller_id"]:
+      await interaction.response.send_message(
+          "❌ Cuma Seller di transaksi ini yang bisa konfirmasi ini.", ephemeral=True
+      )
+      return
+
+    if data.get("payout_confirmed_seller"):
+      await interaction.response.send_message(
+          "⚠️ Konfirmasi ini sudah pernah dilakukan.", ephemeral=True
+      )
+      return
+
+    data["payout_confirmed_seller"] = True
+
+    disabled_view = SellerReceivedView()
+    for child in disabled_view.children:
+      child.disabled = True
+    await interaction.response.edit_message(view=disabled_view)
+
+    await interaction.channel.send(
+        embed=discord.Embed(
+            title="🎉 Transaksi Selesai!",
+            description=(
+                "Semua tahap sudah dikonfirmasi kedua belah pihak. Terima kasih "
+                "sudah pakai jasa Middleman XypherStore! Tiket ini bisa ditutup "
+                "kapan saja lewat tombol 'Tutup Tiket'."
+            ),
+            color=discord.Color.green(),
+        )
+    )
+
+    await kirim_testimoni(interaction.channel, data)
+
+
+# ---------- Kirim proof/testimoni otomatis ke channel #testimoni ----------
+async def kirim_testimoni(channel: discord.TextChannel, data: dict):
+  guild = channel.guild
+  buyer = guild.get_member(data["buyer_id"])
+  seller = guild.get_member(data["seller_id"])
+
+  testimoni_embed = buat_embed_dasar(
+      guild,
+      title="✅ Transaksi Selesai - XypherStore Middleman",
+      color=discord.Color.green(),
+  )
+  testimoni_embed.add_field(name="📦 Item", value=data.get("item_name", "-"), inline=True)
+  testimoni_embed.add_field(
+      name="💰 Nominal", value=f"Rp {data.get('harga', 0):,}", inline=True
+  )
+  testimoni_embed.add_field(
+      name="🛒 Buyer",
+      value=buyer.mention if buyer else "-",
+      inline=True,
+  )
+  testimoni_embed.add_field(
+      name="💰 Seller",
+      value=seller.mention if seller else "-",
+      inline=True,
+  )
+  testimoni_embed.add_field(
+      name="🛡️ Middleman",
+      value=data.get("mm_confirmed_by_name", "-"),
+      inline=True,
+  )
+  testimoni_embed.set_footer(text=f"Ticket: #{channel.name}")
+
+  testimoni_channel = cari_channel(guild, TESTIMONI_CHANNEL_NAME)
+  if testimoni_channel:
+    await testimoni_channel.send(embed=testimoni_embed)
+  else:
+    # Fallback kalau channel #testimoni belum dibuat -- kirim di channel tiket
+    # ini juga sambil kasih tau admin biar bikin channel-nya.
+    await channel.send(
+        content=f"⚠️ Channel `#{TESTIMONI_CHANNEL_NAME}` belum ada, testimoni dikirim di sini dulu:",
+        embed=testimoni_embed,
+    )
 
 
 # ---------- Tombol Tutup Tiket ----------
@@ -796,6 +1304,10 @@ async def on_ready():
   bot.add_view(ConfirmPaymentView())
   bot.add_view(SellerDetailView())
   bot.add_view(BuyerGrowIDView())
+  bot.add_view(ItemReceivedView())
+  bot.add_view(PayoutMethodView())
+  bot.add_view(PayoutConfirmMMView())
+  bot.add_view(SellerReceivedView())
 
 
 @bot.tree.command(
