@@ -897,8 +897,8 @@ class PayoutMethodView(discord.ui.View):
       max_values=1,
       custom_id="payout_method_select",
       options=[
-          discord.SelectOption(label="DANA", value="DANA", emoji="💙"),
-          discord.SelectOption(label="GoPay", value="GoPay", emoji="💚"),
+          discord.SelectOption(label="DANA", value="DANA", emoji="🟠"),
+          discord.SelectOption(label="GoPay", value="GoPay", emoji="🔵"),
           discord.SelectOption(label="QRIS", value="QRIS", emoji="🔲"),
       ],
   )
@@ -936,13 +936,13 @@ class PayoutMethodView(discord.ui.View):
 class PayoutDetailModal(discord.ui.Modal, title="Info Pencairan Dana (Seller)"):
 
   nomor_tujuan = discord.ui.TextInput(
-      label="Nomor Tujuan",
-      placeholder="Contoh: 08123456789",
+      label="Nomor Tujuan (DANA/GoPay)",
+      placeholder="Contoh: 0812-3456-7890",
       max_length=30,
   )
   nama_penerima = discord.ui.TextInput(
       label="Nama Penerima",
-      placeholder="Contoh: Syabria",
+      placeholder="Contoh: Xypher",
       max_length=50,
   )
 
@@ -995,7 +995,7 @@ class PayoutQrisModal(discord.ui.Modal, title="Info Pencairan Dana - QRIS (Selle
 
   nama_penerima = discord.ui.TextInput(
       label="Nama Pemilik QRIS",
-      placeholder="Contoh: Syabria",
+      placeholder="Contoh: Xypher",
       max_length=50,
   )
 
