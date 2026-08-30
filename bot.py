@@ -1,9 +1,11 @@
 import os
+import io
 import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -36,6 +38,9 @@ PAYOUT_ADMIN_FEE = {
     "GoPay": 0,
     "QRIS": 0,
 }
+
+# Path folder font (dipakai buat generate gambar kartu proof/testimoni)
+FONT_DIR = "assets/fonts"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -1205,48 +1210,238 @@ class SellerReceivedView(discord.ui.View):
     await kirim_testimoni(interaction.channel, data)
 
 
+# ---------- Generator gambar kartu proof/testimoni (pakai Pillow) ----------
+_KARTU_BG = (18, 20, 26)
+_KARTU_CARD = (30, 33, 41)
+_KARTU_GOLD = (245, 197, 66)
+_KARTU_GREEN = (67, 181, 129)
+_KARTU_TEXT = (255, 255, 255)
+_KARTU_MUTED = (148, 155, 168)
+_KARTU_W, _KARTU_H = 1000, 560
+
+
+def _teks_aman(teks: str, fallback: str = "-") -> str:
+  """Buang karakter unicode 'fancy'/emoji yang gak punya glyph di font Poppins
+  (misal nickname yang pakai gaya font aneh-aneh), biar gak muncul kotak tofu
+  di kartu. Huruf/angka/tanda baca biasa (termasuk aksen umum) tetap aman.
+  Kalau hasil akhirnya gak ada huruf/angka sama sekali (nickname-nya fancy
+  semua), pakai fallback daripada nyisain simbol doang."""
+  if not teks:
+    return fallback
+  hasil = "".join(c for c in teks if ord(c) < 0x2000)
+  hasil = " ".join(hasil.split())
+  if not hasil or not any(c.isalnum() for c in hasil):
+    return fallback
+  return hasil
+
+
+def _font(nama_file: str, size: int) -> ImageFont.FreeTypeFont:
+  try:
+    return ImageFont.truetype(f"{FONT_DIR}/{nama_file}", size)
+  except OSError:
+    # Fallback ke font default Pillow kalau file font gak ketemu di server
+    return ImageFont.load_default(size=size)
+
+
+def _circle_crop(img: Image.Image, size: int) -> Image.Image:
+  img = ImageOps.fit(img.convert("RGBA"), (size, size), Image.LANCZOS)
+  mask = Image.new("L", (size, size), 0)
+  ImageDraw.Draw(mask).ellipse((0, 0, size, size), fill=255)
+  out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+  out.paste(img, (0, 0), mask)
+  return out
+
+
+def _dashed_line(draw: ImageDraw.ImageDraw, x1, y, x2, color, dash=10, gap=8, width=2):
+  x = x1
+  while x < x2:
+    draw.line([(x, y), (min(x + dash, x2), y)], fill=color, width=width)
+    x += dash + gap
+
+
+def _buat_kartu_proof_mm(
+    item_name: str,
+    nominal: int,
+    buyer_name: str,
+    seller_name: str,
+    mm_name: str,
+    ticket_label: str,
+    timestamp_str: str,
+    logo_bytes: bytes = None,
+    buyer_avatar_bytes: bytes = None,
+    seller_avatar_bytes: bytes = None,
+    mm_avatar_bytes: bytes = None,
+) -> io.BytesIO:
+  """Bikin gambar kartu proof transaksi Middleman (bentuk tiket, 3 pihak:
+  Buyer/Seller/Middleman) & kembalikan sebagai BytesIO PNG, siap dikirim
+  lewat discord.File."""
+  item_name = _teks_aman(item_name, "-")
+  buyer_name = _teks_aman(buyer_name, "Buyer")
+  seller_name = _teks_aman(seller_name, "Seller")
+  mm_name = _teks_aman(mm_name, "Middleman")
+
+  base = Image.new("RGB", (_KARTU_W, _KARTU_H), _KARTU_BG)
+  draw = ImageDraw.Draw(base)
+
+  card_box = (40, 40, _KARTU_W - 40, _KARTU_H - 40)
+  card_layer = Image.new("RGBA", (_KARTU_W, _KARTU_H), (0, 0, 0, 0))
+  ImageDraw.Draw(card_layer).rounded_rectangle(card_box, radius=28, fill=_KARTU_CARD + (255,))
+  base.paste(card_layer, (0, 0), card_layer)
+  draw = ImageDraw.Draw(base)
+
+  # Notch ala tiket di sisi kiri & kanan
+  notch_y = 40 + int((_KARTU_H - 80) * 0.42)
+  r_notch = 22
+  draw.ellipse((card_box[0] - r_notch, notch_y - r_notch, card_box[0] + r_notch, notch_y + r_notch), fill=_KARTU_BG)
+  draw.ellipse((card_box[2] - r_notch, notch_y - r_notch, card_box[2] + r_notch, notch_y + r_notch), fill=_KARTU_BG)
+
+  # Header: logo toko + judul + badge "SELESAI"
+  header_y = 78
+  if logo_bytes:
+    try:
+      logo_img = Image.open(io.BytesIO(logo_bytes))
+      logo = _circle_crop(logo_img, 72)
+      base.paste(logo, (74, header_y), logo)
+      text_x = 74 + 72 + 22
+    except Exception:
+      text_x = 74
+  else:
+    text_x = 74
+
+  f_brand = _font("Poppins-Bold.ttf", 30)
+  f_sub = _font("Poppins-Regular.ttf", 17)
+  draw.text((text_x, header_y + 4), "XypherStore", font=f_brand, fill=_KARTU_TEXT)
+  draw.text((text_x, header_y + 42), "Bukti Transaksi Middleman", font=f_sub, fill=_KARTU_MUTED)
+
+  f_badge = _font("Poppins-SemiBold.ttf", 18)
+  badge_text = "SELESAI"
+  icon_d = 20
+  text_w = draw.textlength(badge_text, font=f_badge)
+  badge_w = 20 + icon_d + 10 + text_w + 20
+  badge_h = 42
+  badge_box = (_KARTU_W - 40 - badge_w - 20, header_y + 8, _KARTU_W - 40 - 20, header_y + 8 + badge_h)
+  draw.rounded_rectangle(badge_box, radius=badge_h // 2, fill=_KARTU_GREEN)
+  icon_cx = badge_box[0] + 20 + icon_d / 2
+  icon_cy = (badge_box[1] + badge_box[3]) / 2
+  check_color = (15, 20, 15)
+  draw.line(
+      [(icon_cx - 6, icon_cy), (icon_cx - 2, icon_cy + 5), (icon_cx + 7, icon_cy - 6)],
+      fill=check_color, width=3, joint="curve",
+  )
+  draw.text((icon_cx + icon_d / 2 + 10, badge_box[1] + 9), badge_text, font=f_badge, fill=check_color)
+
+  # Garis putus-putus pemisah header
+  _dashed_line(draw, card_box[0] + 46, notch_y, card_box[2] - 46, (60, 64, 74))
+
+  # Body: Item / Nominal (cuma 2 kolom -- gak ada konsep jumlah di transaksi MM)
+  body_y = notch_y + 42
+  f_label = _font("Poppins-Regular.ttf", 16)
+  f_value = _font("Poppins-SemiBold.ttf", 26)
+  col_w = (card_box[2] - card_box[0] - 92) / 2
+  for i, (label, value, color) in enumerate([
+      ("ITEM", item_name, _KARTU_TEXT),
+      ("NOMINAL", f"Rp {nominal:,}", _KARTU_GOLD),
+  ]):
+    x = card_box[0] + 46 + i * col_w
+    draw.text((x, body_y), label, font=f_label, fill=_KARTU_MUTED)
+    draw.text((x, body_y + 26), value, font=f_value, fill=color)
+
+  # Garis putus-putus sebelum footer
+  sep2_y = body_y + 100
+  _dashed_line(draw, card_box[0] + 46, sep2_y, card_box[2] - 46, (60, 64, 74))
+
+  # Buyer, Seller & Middleman (avatar + nama) -- 3 kolom
+  row_y = sep2_y + 30
+  avatar_size = 52
+  f_role = _font("Poppins-Regular.ttf", 14)
+  f_name = _font("Poppins-SemiBold.ttf", 18)
+  col3_w = (card_box[2] - card_box[0] - 92) / 3
+
+  def _draw_person(x, role, name, avatar_bytes):
+    name_x = x
+    if avatar_bytes:
+      try:
+        av_img = Image.open(io.BytesIO(avatar_bytes))
+        av = _circle_crop(av_img, avatar_size)
+        base.paste(av, (int(x), row_y), av)
+        name_x = x + avatar_size + 14
+      except Exception:
+        pass
+    draw.text((name_x, row_y + 2), role, font=f_role, fill=_KARTU_MUTED)
+    draw.text((name_x, row_y + 20), name, font=f_name, fill=_KARTU_TEXT)
+
+  _draw_person(card_box[0] + 46, "BUYER", buyer_name, buyer_avatar_bytes)
+  _draw_person(card_box[0] + 46 + col3_w, "SELLER", seller_name, seller_avatar_bytes)
+  _draw_person(card_box[0] + 46 + col3_w * 2, "MIDDLEMAN", mm_name, mm_avatar_bytes)
+
+  # Footer
+  f_footer = _font("Poppins-Regular.ttf", 14)
+  draw.text(
+      (card_box[0] + 46, card_box[3] - 40),
+      f"{ticket_label}  •  {timestamp_str}",
+      font=f_footer,
+      fill=_KARTU_MUTED,
+  )
+
+  buffer = io.BytesIO()
+  base.save(buffer, format="PNG")
+  buffer.seek(0)
+  return buffer
+
+
+async def _baca_avatar_bytes(member: discord.Member | None) -> bytes | None:
+  if member is None:
+    return None
+  try:
+    return await member.display_avatar.read()
+  except Exception:
+    return None
+
+
 # ---------- Kirim proof/testimoni otomatis ke channel #testimoni ----------
 async def kirim_testimoni(channel: discord.TextChannel, data: dict):
   guild = channel.guild
   buyer = guild.get_member(data["buyer_id"])
   seller = guild.get_member(data["seller_id"])
+  mm_member = None
+  if data.get("mm_confirmed_by_id"):
+    mm_member = guild.get_member(data["mm_confirmed_by_id"])
 
-  testimoni_embed = buat_embed_dasar(
-      guild,
-      title="✅ Transaksi Selesai - XypherStore Middleman",
-      color=discord.Color.green(),
+  logo_bytes = None
+  if guild.icon:
+    try:
+      logo_bytes = await guild.icon.read()
+    except Exception:
+      logo_bytes = None
+
+  buyer_avatar_bytes = await _baca_avatar_bytes(buyer)
+  seller_avatar_bytes = await _baca_avatar_bytes(seller)
+  mm_avatar_bytes = await _baca_avatar_bytes(mm_member)
+
+  waktu_sekarang = discord.utils.utcnow().strftime("%d %b %Y, %H:%M UTC")
+
+  buffer = _buat_kartu_proof_mm(
+      item_name=data.get("item_name", "-"),
+      nominal=data.get("harga", 0),
+      buyer_name=buyer.display_name if buyer else "Buyer",
+      seller_name=seller.display_name if seller else "Seller",
+      mm_name=data.get("mm_confirmed_by_name", "Middleman"),
+      ticket_label=f"Ticket: #{channel.name}",
+      timestamp_str=waktu_sekarang,
+      logo_bytes=logo_bytes,
+      buyer_avatar_bytes=buyer_avatar_bytes,
+      seller_avatar_bytes=seller_avatar_bytes,
+      mm_avatar_bytes=mm_avatar_bytes,
   )
-  testimoni_embed.add_field(name="📦 Item", value=data.get("item_name", "-"), inline=True)
-  testimoni_embed.add_field(
-      name="💰 Nominal", value=f"Rp {data.get('harga', 0):,}", inline=True
-  )
-  testimoni_embed.add_field(
-      name="🛒 Buyer",
-      value=buyer.mention if buyer else "-",
-      inline=True,
-  )
-  testimoni_embed.add_field(
-      name="💰 Seller",
-      value=seller.mention if seller else "-",
-      inline=True,
-  )
-  testimoni_embed.add_field(
-      name="🛡️ Middleman",
-      value=data.get("mm_confirmed_by_name", "-"),
-      inline=True,
-  )
-  testimoni_embed.set_footer(text=f"Ticket: #{channel.name}")
+  proof_file = discord.File(buffer, filename="proof_transaksi.png")
 
   testimoni_channel = cari_channel(guild, TESTIMONI_CHANNEL_NAME)
-  if testimoni_channel:
-    await testimoni_channel.send(embed=testimoni_embed)
-  else:
-    # Fallback kalau channel #testimoni belum dibuat -- kirim di channel tiket
-    # ini juga sambil kasih tau admin biar bikin channel-nya.
+  target_channel = testimoni_channel if testimoni_channel else channel
+  if not testimoni_channel:
     await channel.send(
-        content=f"⚠️ Channel `#{TESTIMONI_CHANNEL_NAME}` belum ada, testimoni dikirim di sini dulu:",
-        embed=testimoni_embed,
+        f"⚠️ Channel `#{TESTIMONI_CHANNEL_NAME}` belum ada, proof dikirim di sini dulu:"
     )
+  await target_channel.send(file=proof_file)
 
 
 # ---------- Tombol Tutup Tiket ----------
